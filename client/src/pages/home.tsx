@@ -332,13 +332,6 @@ export default function Home() {
           />
 
           <div className="text-center mb-8">
-            <motion.div
-              animate={{ rotate: [0, 10, -10, 0] }}
-              transition={{ repeat: Infinity, duration: 4, ease: "easeInOut" }}
-              className="inline-block mb-3"
-            >
-              <Sparkles className="w-6 h-6 mx-auto" style={{ color: "hsl(35 90% 55%)" }} />
-            </motion.div>
             <h2 className="text-2xl font-bold mb-2" style={{
               background: "linear-gradient(135deg, hsl(9 75% 61%), hsl(35 90% 55%))",
               WebkitBackgroundClip: "text",
@@ -348,7 +341,7 @@ export default function Home() {
               Let's Build Something Together
             </h2>
             <p className="text-muted-foreground text-sm max-w-md mx-auto">
-              Open to collaborating on open source projects, innovative ideas, and exciting developer tools. Let's connect!
+              Open to collaborating on open source projects, innovative ideas, and developer tools. Reach out to connect.
             </p>
           </div>
 
@@ -450,7 +443,7 @@ export default function Home() {
             transition={{ delay: 2, duration: 0.6 }}
             className="text-center text-xs text-muted-foreground mt-10"
           >
-            Built with ❤️ by <span className="font-semibold" style={{ color: "hsl(9 75% 61%)" }}>Indrakumar M</span> · Open for collaboration & open source projects
+            Designed & developed by <span className="font-semibold" style={{ color: "hsl(9 75% 61%)" }}>Indrakumar M</span> · Available for open source collaboration
           </motion.p>
         </motion.div>
       </div>
