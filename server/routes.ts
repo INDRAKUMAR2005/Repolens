@@ -1,0 +1,451 @@
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import {
+  fetchRepoInfo,
+  fetchRepoTree,
+  fetchKeyFiles,
+  fetchLanguages,
+  getDownloadUrl,
+  parseRepoUrl as parseGitHubUrl,
+} from "./github";
+import {
+  analyzeRepository,
+  generateReadmeArchitecture,
+  generateFullReadme,
+  generateMermaidDiagram,
+} from "./gemini";
+import type { AnalysisResult } from "@shared/schema";
+import {
+  authMiddleware,
+  optionalAuthMiddleware,
+  hashPassword,
+  comparePassword,
+  signToken,
+  verifyToken,
+} from "./auth";
+
+// parseGitHubUrl is now imported and aliased from github.ts
+
+export async function registerRoutes(
+  httpServer: Server,
+  app: Express,
+): Promise<Server> {
+  // Health check endpoint
+  app.get("/api/health", (req, res) => {
+    const health = {
+      status: "ok",
+      timestamp: new Date().toISOString(),
+      environment: {
+        nodeEnv: process.env.NODE_ENV || "development",
+        hasGithubToken: !!process.env.GITHUB_TOKEN || !!process.env.GITLAB_TOKEN,
+        hasGeminiApiKey: !!process.env.GEMINI_API_KEY,
+      },
+      warnings: [] as string[],
+    };
+
+    if (!process.env.GITHUB_TOKEN && !process.env.GITLAB_TOKEN) {
+      health.warnings.push(
+        "No platform tokens (GITHUB_TOKEN/GITLAB_TOKEN) configured. API rate limits may apply."
+      );
+    }
+
+    if (!process.env.GEMINI_API_KEY) {
+      health.warnings.push(
+        "GEMINI_API_KEY not configured. Repository analysis will fail."
+      );
+    }
+
+    res.json(health);
+  });
+
+  app.post("/api/auth/signup", async (req, res) => {
+    try {
+      const { username, password } = req.body;
+      if (!username || !password) {
+        return res
+          .status(400)
+          .json({ error: "Username and password are required" });
+      }
+      if (username.length < 3) {
+        return res
+          .status(400)
+          .json({ error: "Username must be at least 3 characters" });
+      }
+      if (password.length < 6) {
+        return res
+          .status(400)
+          .json({ error: "Password must be at least 6 characters" });
+      }
+
+      const existing = await storage.getUserByUsername(username);
+      if (existing) {
+        return res.status(409).json({ error: "Username already taken" });
+      }
+
+      const hashedPassword = await hashPassword(password);
+      const user = await storage.createUser({
+        username,
+        password: hashedPassword,
+      });
+
+      const token = signToken({ userId: user.id, username: user.username });
+      return res.json({
+        token,
+        user: { id: user.id, username: user.username },
+      });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/auth/signin", async (req, res) => {
+    try {
+      const { username, password } = req.body;
+      if (!username || !password) {
+        return res
+          .status(400)
+          .json({ error: "Username and password are required" });
+      }
+
+      const user = await storage.getUserByUsername(username);
+      if (!user) {
+        return res.status(401).json({ error: "Invalid username or password" });
+      }
+
+      const valid = await comparePassword(password, user.password);
+      if (!valid) {
+        return res.status(401).json({ error: "Invalid username or password" });
+      }
+
+      const token = signToken({ userId: user.id, username: user.username });
+      return res.json({
+        token,
+        user: { id: user.id, username: user.username },
+      });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get("/api/auth/me", authMiddleware, async (req, res) => {
+    return res.json({
+      user: { id: req.user!.userId, username: req.user!.username },
+    });
+  });
+
+  app.get("/api/user/analyses", authMiddleware, async (req, res) => {
+    try {
+      const analyses = await storage.getAnalysesByUser(req.user!.userId);
+      return res.json(
+        analyses.map((a) => ({
+          id: a.id,
+          repoUrl: a.repoUrl,
+          owner: a.owner,
+          repo: a.repo,
+          createdAt: a.createdAt,
+        })),
+      );
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/validate-url", async (req, res) => {
+    try {
+      const { url } = req.body;
+      if (!url) {
+        return res.status(400).json({ valid: false, error: "URL is required" });
+      }
+
+      const parsed = parseGitHubUrl(url);
+      if (!parsed) {
+        return res.status(400).json({
+          valid: false,
+          error:
+            "Invalid repository URL. Please use a valid GitHub or GitLab link.",
+        });
+      }
+
+      try {
+        const repoInfo = await fetchRepoInfo(parsed.owner, parsed.repo, url);
+        const downloadUrl = getDownloadUrl(parsed.owner, parsed.repo, url, repoInfo.defaultBranch);
+        return res.json({
+          valid: true,
+          owner: parsed.owner,
+          repo: parsed.repo,
+          repoInfo,
+          downloadUrl,
+        });
+      } catch (err: any) {
+        return res.status(404).json({
+          valid: false,
+          error: `Repository not found: ${parsed.owner}/${parsed.repo}`,
+        });
+      }
+    } catch (error: any) {
+      return res.status(500).json({ valid: false, error: error.message });
+    }
+  });
+
+  app.post("/api/analyze", optionalAuthMiddleware, async (req, res) => {
+    const startTime = Date.now();
+    console.log("[API] /api/analyze request started", { url: req.body.url });
+
+    try {
+      const { url, forceRefresh } = req.body;
+      if (!url) {
+        console.error("[API] Error: URL is required");
+        return res.status(400).json({ error: "URL is required" });
+      }
+
+      if (!process.env.GEMINI_API_KEY) {
+        console.error("[API] Error: GEMINI_API_KEY not configured");
+        return res.status(500).json({
+          error: "Gemini API key is not configured. Please set the GEMINI_API_KEY environment variable.",
+        });
+      }
+
+      const parsed = parseGitHubUrl(url);
+      if (!parsed) {
+        console.error("[API] Error: Invalid repository URL format", { url });
+        return res.status(400).json({
+          error:
+            "Invalid repository URL. Please use a valid GitHub or GitLab link.",
+        });
+      }
+
+      console.log("[API] Parsed Repository URL:", parsed);
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+
+      const sendEvent = (data: any) => {
+        console.log("[SSE] Sending event:", data.step, data.message?.substring(0, 50));
+        try {
+          res.write(`data: ${JSON.stringify(data)}\n\n`);
+        } catch (writeError: any) {
+          console.error("[SSE] Failed to write event:", writeError.message);
+        }
+      };
+
+      try {
+        if (!forceRefresh) {
+          const cached = await storage.getAnalysisByRepo(
+            parsed.owner,
+            parsed.repo,
+          );
+          if (cached) {
+            const cachedData = cached.analysisData as AnalysisResult;
+            // Ensure download URL is present even in cached versions
+            if (!cachedData.downloadUrl) {
+              cachedData.downloadUrl = getDownloadUrl(parsed.owner, parsed.repo, url, cachedData.repoInfo?.defaultBranch);
+            }
+            sendEvent({ step: "info", message: "Loading cached analysis..." });
+            sendEvent({
+              step: "complete",
+              message: "Analysis complete!",
+              id: cached.id,
+              analysis: cachedData,
+            });
+            return res.end();
+          }
+        }
+
+        sendEvent({ step: "info", message: "Fetching repository data..." });
+        console.log("[API] Fetching repository data for:", `${parsed.owner}/${parsed.repo}`);
+
+        const [repoInfo, fileTree, languages] = await Promise.all([
+          fetchRepoInfo(parsed.owner, parsed.repo, url),
+          fetchRepoTree(parsed.owner, parsed.repo, url),
+          fetchLanguages(parsed.owner, parsed.repo, url)
+        ]);
+
+        console.log("[API] Initial data fetched successfully");
+
+        sendEvent({
+          step: "files",
+          message: `Reading ${Math.min(fileTree.length, 60)} key files...`,
+        });
+        const keyFiles = await fetchKeyFiles(parsed.owner, parsed.repo, fileTree, url);
+
+        sendEvent({
+          step: "analysis",
+          message: "AI is analyzing the codebase architecture...",
+        });
+        const analysis = await analyzeRepository(
+          repoInfo,
+          fileTree,
+          keyFiles,
+          languages,
+        );
+
+        // Inject download URL
+        analysis.downloadUrl = getDownloadUrl(parsed.owner, parsed.repo, url, repoInfo.defaultBranch);
+
+        sendEvent({
+          step: "saving",
+          message: "Saving analysis results...",
+        });
+
+        const saved = await storage.createAnalysis({
+          repoUrl: url,
+          owner: parsed.owner,
+          repo: parsed.repo,
+          userId: req.user?.userId || null,
+          analysisData: analysis,
+        });
+
+        sendEvent({
+          step: "complete",
+          message: "Analysis complete!",
+          id: saved.id,
+          analysis,
+        });
+
+        res.end();
+      } catch (innerError: any) {
+        console.error("[API] Analysis streaming error:", {
+          message: innerError.message,
+          status: innerError.status,
+          stack: innerError.stack?.substring(0, 200),
+        });
+        let userMessage = innerError.message || "An unexpected error occurred";
+        // Use the improved error message from gemini.ts
+        if (
+          userMessage.includes("JSON") ||
+          userMessage.includes("parse") ||
+          userMessage.includes("Unexpected token") ||
+          userMessage.includes("incomplete response")
+        ) {
+          userMessage = innerError.message;
+        }
+
+        // Always send error event, even if streaming hasn't started
+        try {
+          sendEvent({ step: "error", message: userMessage });
+        } catch (sendError) {
+          console.error("[API] Failed to send error event:", sendError);
+        }
+
+        try {
+          res.end();
+        } catch (endError) {
+          console.error("[API] Failed to end response:", endError);
+        }
+      }
+    } catch (error: any) {
+      const elapsed = Date.now() - startTime;
+      console.error("[API] Top-level analysis error:", {
+        message: error.message,
+        status: error.status,
+        elapsed: `${elapsed}ms`,
+        stack: error.stack?.substring(0, 300),
+      });
+
+      let userMessage = error.message || "An unexpected error occurred";
+      // Use the improved error message from gemini.ts
+      if (
+        userMessage.includes("JSON") ||
+        userMessage.includes("parse") ||
+        userMessage.includes("Unexpected token") ||
+        userMessage.includes("incomplete response")
+      ) {
+        userMessage = error.message;
+      }
+
+      try {
+        if (res.headersSent) {
+          console.log("[API] Headers already sent, writing error to stream");
+          res.write(
+            `data: ${JSON.stringify({ step: "error", message: userMessage })}\n\n`,
+          );
+          res.end();
+        } else {
+          console.log("[API] Headers not sent, returning JSON error");
+          res.status(500).json({ error: userMessage });
+        }
+      } catch (responseError: any) {
+        console.error("[API] Failed to send error response:", responseError.message);
+      }
+    }
+
+    console.log("[API] /api/analyze request completed in", Date.now() - startTime, "ms");
+  });
+
+  app.get("/api/analysis/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const analysis = await storage.getAnalysis(id);
+      if (!analysis) {
+        return res.status(404).json({ error: "Analysis not found" });
+      }
+      return res.json({
+        id: analysis.id,
+        analysis: analysis.analysisData as AnalysisResult,
+      });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/generate-readme", async (req, res) => {
+    try {
+      const { analysis } = req.body;
+      if (!analysis) {
+        return res.status(400).json({ error: "Analysis data is required" });
+      }
+      const readme = await generateReadmeArchitecture(analysis);
+      return res.json({ readme });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/generate-full-readme", optionalAuthMiddleware, async (req, res) => {
+    try {
+      const { url } = req.body;
+      if (!url) {
+        return res.status(400).json({ error: "Repository URL is required" });
+      }
+
+      const parsed = parseGitHubUrl(url);
+      if (!parsed) {
+        return res.status(400).json({ error: "Invalid repository URL format" });
+      }
+
+      const { owner, repo: cleanRepo } = parsed;
+
+      const [repoInfo, tree, languages] = await Promise.all([
+        fetchRepoInfo(owner, cleanRepo, url),
+        fetchRepoTree(owner, cleanRepo, url),
+        fetchLanguages(owner, cleanRepo, url),
+      ]);
+      const keyFiles = await fetchKeyFiles(owner, cleanRepo, tree, url);
+
+      const analysis = await analyzeRepository(repoInfo, tree, keyFiles, languages);
+      analysis.downloadUrl = getDownloadUrl(owner, cleanRepo, url, repoInfo.defaultBranch);
+      const readme = await generateFullReadme(analysis);
+
+      return res.json({ readme, analysis });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/generate-mermaid", async (req, res) => {
+    try {
+      const { analysis } = req.body;
+      if (!analysis) {
+        return res.status(400).json({ error: "Analysis data is required" });
+      }
+      const mermaid = await generateMermaidDiagram(analysis);
+      return res.json({ mermaid });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  return httpServer;
+}
